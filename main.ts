@@ -14,7 +14,8 @@ interface Base64ImageMatch {
 	end: number;
 	altText: string;
 	mimeType: string;
-	imageType: string;
+	imageSubtype: string;
+	fileExtension: string;
 	base64Payload: string;
 	originalText: string;
 }
@@ -83,15 +84,65 @@ const DEFAULT_SETTINGS: ConvertBase64ToPNGSettings = {
 	preserveAltText: true
 };
 
-const BASE64_IMAGE_REGEX = /!\[(.*?)\]\((data:(image\/([a-zA-Z0-9.+-]+));base64,([^)]+))\)/g;
+const BASE64_IMAGE_PATTERN = String.raw`!\[([\s\S]*?)\]\((data:(image\/([a-zA-Z0-9.+-]+));base64,([A-Za-z0-9+/=\r\n\s]+))\)`;
 const DATE_PLACEHOLDER = '{{date}}';
 const INDEX_PLACEHOLDER = '{{index}}';
 const TYPE_PLACEHOLDER = '{{type}}';
 const FINAL_STATUS_TIMEOUT_MS = 10000;
+const DEFAULT_IMAGE_EXTENSION = 'png';
+const MIME_SUBTYPE_EXTENSION_MAP: Record<string, string> = {
+	'jpeg': 'jpg',
+	'pjpeg': 'jpg',
+	'svg+xml': 'svg',
+	'x-icon': 'ico',
+	'vnd.microsoft.icon': 'ico'
+};
 
 function normalizeImageSize(size?: string): string | undefined {
 	const normalizedSize = size?.trim();
 	return normalizedSize ? normalizedSize : undefined;
+}
+
+function createBase64ImageRegex(): RegExp {
+	return new RegExp(BASE64_IMAGE_PATTERN, 'g');
+}
+
+function normalizeBase64Payload(payload: string): string {
+	return payload.replace(/\s+/g, '');
+}
+
+function getFileExtensionForMimeSubtype(imageSubtype: string): string {
+	const normalizedSubtype = imageSubtype.toLowerCase();
+	return MIME_SUBTYPE_EXTENSION_MAP[normalizedSubtype] ?? sanitizeFilenameSegment(normalizedSubtype) ?? DEFAULT_IMAGE_EXTENSION;
+}
+
+function sanitizeFilenameSegment(value: string): string {
+	const sanitized = value
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, '-')
+		.replace(/^-+|-+$/g, '');
+
+	return sanitized || 'image';
+}
+
+function sanitizeFilenameStem(value: string): string {
+	const sanitized = value
+		.trim()
+		.replace(/[\/:*?"<>|]+/g, '-')
+		.replace(/\s+/g, '-')
+		.replace(/-+/g, '-')
+		.replace(/^[-. ]+|[-. ]+$/g, '');
+
+	return sanitized || 'image';
+}
+
+function escapeForRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getFileDirectory(file: TFile): string {
+	return file.parent?.path === '/' ? '' : file.parent?.path ?? '';
 }
 
 function formatImageReference(
@@ -396,17 +447,20 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 
 	findBase64Images(content: string): Base64ImageMatch[] {
 		const matches: Base64ImageMatch[] = [];
+		const regex = createBase64ImageRegex();
 		let match: RegExpExecArray | null;
 
-		BASE64_IMAGE_REGEX.lastIndex = 0;
-		while ((match = BASE64_IMAGE_REGEX.exec(content)) !== null) {
+		while ((match = regex.exec(content)) !== null) {
+			const imageSubtype = match[3];
+			const normalizedPayload = normalizeBase64Payload(match[4]);
 			matches.push({
 				start: match.index,
 				end: match.index + match[0].length,
 				altText: match[1],
 				mimeType: match[2],
-				imageType: match[3],
-				base64Payload: match[4],
+				imageSubtype,
+				fileExtension: getFileExtensionForMimeSubtype(imageSubtype),
+				base64Payload: normalizedPayload,
 				originalText: match[0]
 			});
 		}
@@ -724,11 +778,13 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		};
 	}
 
-	private buildImageFilename(format: string, timestamp: string | null, index: number, imageType: string): string {
-		return format
+	private buildImageFilename(format: string, timestamp: string | null, index: number, imageType: string, extension: string): string {
+		const rawStem = format
 			.split(DATE_PLACEHOLDER).join(timestamp ?? '')
 			.split(INDEX_PLACEHOLDER).join(index.toString())
-			.split(TYPE_PLACEHOLDER).join(imageType) + '.png';
+			.split(TYPE_PLACEHOLDER).join(sanitizeFilenameSegment(imageType));
+
+		return `${sanitizeFilenameStem(rawStem)}.${sanitizeFilenameSegment(extension)}`;
 	}
 
 	private createFilenameMetadata(format: string): FileFilenameMetadata {
@@ -752,8 +808,7 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 	}
 
 	private getOutputFolderPath(file: TFile, outputFolder: string): string {
-		const lastSlashIndex = file.path.lastIndexOf('/');
-		const fileDir = lastSlashIndex === -1 ? '' : file.path.substring(0, lastSlashIndex);
+		const fileDir = getFileDirectory(file);
 		return normalizePath(fileDir ? `${fileDir}/${outputFolder}` : outputFolder);
 	}
 
@@ -789,8 +844,13 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		match: Base64ImageMatch
 	): Promise<string> {
 		const timestamp = filenameMetadata.needsDate ? filenameMetadata.getTimestamp() : null;
-		const baseFilename = this.buildImageFilename(format, timestamp, index, match.imageType);
+		const baseFilename = this.buildImageFilename(format, timestamp, index, match.imageSubtype, match.fileExtension);
 		const contentHash = this.computeContentHash(match.base64Payload);
+		const existingFilename = await this.findExistingImageFilename(outputFolderPath, contentHash, match.fileExtension);
+		if (existingFilename) {
+			return existingFilename;
+		}
+
 		const filenameWithHash = this.appendFilenameSuffix(baseFilename, contentHash);
 
 		if (!(await this.app.vault.adapter.exists(normalizePath(`${outputFolderPath}/${filenameWithHash}`)))) {
@@ -806,6 +866,27 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			}
 			attempt++;
 		}
+	}
+
+	private async findExistingImageFilename(outputFolderPath: string, contentHash: string, extension: string): Promise<string | null> {
+		if (!(await this.app.vault.adapter.exists(outputFolderPath))) {
+			return null;
+		}
+
+		const normalizedExtension = sanitizeFilenameSegment(extension);
+		const escapedHash = escapeForRegExp(contentHash);
+		const escapedExtension = escapeForRegExp(normalizedExtension);
+		const existingFilePattern = new RegExp(`-${escapedHash}(?:-\\d+)?\\.${escapedExtension}$`);
+		const listing = await this.app.vault.adapter.list(outputFolderPath);
+
+		for (const path of listing.files) {
+			const filename = path.split('/').pop();
+			if (filename && existingFilePattern.test(filename)) {
+				return filename;
+			}
+		}
+
+		return null;
 	}
 
 	private appendFilenameSuffix(filename: string, suffix: string): string {
@@ -862,7 +943,7 @@ class ConvertBase64ToPNGSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Output folder')
-			.setDesc('Folder where PNG files will be saved (relative to the note)')
+			.setDesc('Folder where extracted image files will be saved (relative to the note)')
 			.addText(text => text
 				.setPlaceholder('attachments')
 				.setValue(this.plugin.settings.outputFolder)
@@ -883,7 +964,7 @@ class ConvertBase64ToPNGSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Filename format')
-			.setDesc('Format for generated filenames. Available placeholders: {{date}}, {{index}}, {{type}}')
+			.setDesc('Format for generated filenames. Available placeholders: {{date}}, {{index}}, {{type}}. The plugin preserves the source image extension; it does not transcode image data.')
 			.addText(text => text
 				.setPlaceholder('image-{{date}}-{{index}}')
 				.setValue(this.plugin.settings.filenameFormat)
