@@ -12,7 +12,7 @@ This plugin for [Obsidian](https://obsidian.md) converts base64-encoded images i
 - **Batch Processing**: Process individual files or all files in your vault
 - **Customizable Storage**: Configure where and how PNG files are stored
 - **Flexible Output Links**: Generate standard Markdown image links or Obsidian wikilink embeds
-- **Automatic Conversion**: Option to automatically convert base64 images when pasting
+- **Automatic Conversion**: Option to automatically convert pasted inline base64 image markdown
 
 ## How It Works
 
@@ -24,6 +24,8 @@ When you run the plugin:
 4. Updates the links in your notes to point to the local PNG files
 
 This makes your notes smaller, more portable, and easier to work with.
+
+When auto-convert is enabled, the paste handler is optimized for pasted inline base64 image markdown. It inspects the clipboard payload first and only converts the newly inserted pasted range when that payload actually contains inline base64 image markdown.
 
 ## Output examples
 
@@ -41,7 +43,7 @@ Alt text is preserved only for Markdown output. In wikilink mode the plugin curr
 
 ### General Settings
 
-- **Auto Convert**: Automatically convert base64 images when pasting
+- **Auto Convert**: Automatically convert pasted inline base64 image markdown, optimized to inspect pasted text first and avoid full-note rescans for ordinary paste operations
 - **Output Folder**: Folder where PNG files will be saved (relative to the note)
 - **Filename Format**: Format for generated filenames with placeholders for date, index, and image type
 - **Link Style**: Choose between Markdown image links and Obsidian wikilink embeds

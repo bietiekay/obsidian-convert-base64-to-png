@@ -236,6 +236,7 @@ class ConversionProgressDisplay {
 
 export default class ConvertBase64ToPNGPlugin extends Plugin {
 	settings: ConvertBase64ToPNGSettings;
+	private isHandlingPasteConversion = false;
 
 	async onload() {
 		await this.loadSettings();
@@ -258,18 +259,11 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 
 		this.addSettingTab(new ConvertBase64ToPNGSettingTab(this.app, this));
 
-		if (this.settings.autoConvert) {
-			this.registerEvent(
-				this.app.workspace.on('editor-paste', (_: ClipboardEvent, editor: Editor) => {
-					setTimeout(() => {
-						const content = editor.getValue();
-						if (this.containsBase64Image(content)) {
-							void this.runCurrentFileConversion(editor, this.app.workspace.getActiveFile());
-						}
-					}, 100);
-				})
-			);
-		}
+		this.registerEvent(
+			this.app.workspace.on('editor-paste', (event: ClipboardEvent, editor: Editor, info: MarkdownView) => {
+				void this.handleEditorPaste(event, editor, info);
+			})
+		);
 	}
 
 	onunload() {
@@ -282,6 +276,118 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	private async handleEditorPaste(event: ClipboardEvent, editor: Editor, info: MarkdownView) {
+		if (!this.settings.autoConvert || this.isHandlingPasteConversion) {
+			return;
+		}
+
+		const file = info.file ?? this.app.workspace.getActiveFile();
+		if (!file) {
+			return;
+		}
+
+		const pastedText = this.getPastedText(event);
+		if (!pastedText || !this.containsBase64Image(pastedText)) {
+			return;
+		}
+
+		const selectionStart = editor.getCursor('from');
+		const selectionEnd = editor.getCursor('to');
+		const selectionStartOffset = editor.posToOffset(selectionStart);
+		const selectionEndOffset = editor.posToOffset(selectionEnd);
+		const previousContent = editor.getValue();
+
+		window.setTimeout(() => {
+			void this.convertPastedRangeIfNeeded(editor, file, previousContent, selectionStartOffset, selectionEndOffset);
+		}, 0);
+	}
+
+	private getPastedText(event: ClipboardEvent): string {
+		const clipboardData = event.clipboardData;
+		if (!clipboardData) {
+			return '';
+		}
+
+		return clipboardData.getData('text/plain')
+			|| clipboardData.getData('text/markdown')
+			|| clipboardData.getData('text/html')
+			|| '';
+	}
+
+	private async convertPastedRangeIfNeeded(
+		editor: Editor,
+		file: TFile,
+		previousContent: string,
+		selectionStartOffset: number,
+		selectionEndOffset: number
+	) {
+		const currentContent = editor.getValue();
+		const insertedRange = this.getInsertedRange(previousContent, currentContent, selectionStartOffset, selectionEndOffset);
+		if (!insertedRange) {
+			return;
+		}
+
+		const pastedContent = currentContent.slice(insertedRange.start, insertedRange.end);
+		const matches = this.findBase64Images(pastedContent);
+		if (matches.length === 0) {
+			return;
+		}
+
+		this.isHandlingPasteConversion = true;
+		const display = new ConversionProgressDisplay(this, {
+			allowCancel: false,
+			label: 'Base64 → PNG'
+		});
+
+		try {
+			const result = await this.convertMatchesInContent(
+				this.createScannedFileEntry(file, pastedContent, matches),
+				this.settings,
+				new Map<string, Promise<void>>(),
+				(progress) => display.update(progress)
+			);
+
+			if (!result.changed) {
+				display.finish('No base64 images found in pasted content', false);
+				return;
+			}
+
+			const rangeStart = editor.offsetToPos(insertedRange.start);
+			const rangeEnd = editor.offsetToPos(insertedRange.end);
+			editor.replaceRange(result.newContent, rangeStart, rangeEnd);
+
+			const summary = `Converted ${result.convertedCount} pasted base64 image${result.convertedCount !== 1 ? 's' : ''} (${result.skippedCount} skipped, ${result.errors.length} failed)`;
+			display.finish(summary, false);
+			new Notice(summary);
+		} catch (error) {
+			display.destroy();
+			throw error;
+		} finally {
+			this.isHandlingPasteConversion = false;
+		}
+	}
+
+	private getInsertedRange(
+		previousContent: string,
+		currentContent: string,
+		selectionStartOffset: number,
+		selectionEndOffset: number
+	): { start: number; end: number } | null {
+		const replacedLength = selectionEndOffset - selectionStartOffset;
+		const insertedLength = currentContent.length - (previousContent.length - replacedLength);
+		if (insertedLength <= 0) {
+			return null;
+		}
+
+		const start = selectionStartOffset;
+		const end = selectionStartOffset + insertedLength;
+		if (start < 0 || end > currentContent.length) {
+			return null;
+		}
+
+		return { start, end };
 	}
 
 	containsBase64Image(content: string): boolean {
@@ -418,14 +524,7 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			const content = await this.app.vault.read(file);
 			const matches = this.findBase64Images(content);
 			if (matches.length > 0) {
-				scannedEntries.push({
-					file,
-					content,
-					matches,
-					outputFolderPath: this.getOutputFolderPath(file, this.settings.outputFolder),
-					relativeOutputFolderPath: this.getRelativeOutputFolderPath(this.settings.outputFolder),
-					filenameMetadata: this.createFilenameMetadata(this.settings.filenameFormat)
-				});
+				scannedEntries.push(this.createScannedFileEntry(file, content, matches));
 			}
 
 			scannedFiles = index + 1;
@@ -518,6 +617,17 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			totalMatches: totalImages,
 			errors,
 			cancelled
+		};
+	}
+
+	private createScannedFileEntry(file: TFile, content: string, matches: Base64ImageMatch[]): ScannedFileEntry {
+		return {
+			file,
+			content,
+			matches,
+			outputFolderPath: this.getOutputFolderPath(file, this.settings.outputFolder),
+			relativeOutputFolderPath: this.getRelativeOutputFolderPath(this.settings.outputFolder),
+			filenameMetadata: this.createFilenameMetadata(this.settings.filenameFormat)
 		};
 	}
 
@@ -763,7 +873,7 @@ class ConvertBase64ToPNGSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Auto convert')
-			.setDesc('Automatically convert base64 images when pasting')
+			.setDesc('Automatically convert pasted inline base64 image markdown, scanning the pasted text first so regular paste operations do not trigger a full-note rescan.')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.autoConvert)
 				.onChange(async (value) => {
