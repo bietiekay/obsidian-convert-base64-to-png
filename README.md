@@ -109,15 +109,3 @@ Alt text is preserved only for Markdown output. In wikilink mode the plugin curr
 - **Better Organization**: Keep your images in a dedicated folder instead of embedded in your notes
 - **Easier Editing**: Smaller markdown files are easier to edit and work with
 
----
-
-<div align="center">
-  <p>If you find this plugin useful, consider supporting me:</p>
-  <a href="https://www.buymeacoffee.com/xmasterdev" target="_blank">
-    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;">
-  </a>
-  <p>or</p>
-  <a href="https://ko-fi.com/nykkolin" target="_blank">
-    <img src="https://img.shields.io/badge/Support%20me%20on-Ko--fi-blue?style=for-the-badge&logo=ko-fi" alt="Support me on Ko-fi">
-  </a>
-</div>
