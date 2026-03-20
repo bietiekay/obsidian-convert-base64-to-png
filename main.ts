@@ -39,6 +39,7 @@ interface FileConversionResult {
 	skippedCount: number;
 	errors: ConversionError[];
 	totalMatches: number;
+	changed: boolean;
 }
 
 interface FilesConversionResult {
@@ -50,6 +51,25 @@ interface FilesConversionResult {
 	errors: ConversionError[];
 }
 
+interface ScannedFileEntry {
+	file: TFile;
+	content: string;
+	matches: Base64ImageMatch[];
+	outputFolderPath: string;
+	relativeOutputFolderPath: string;
+	filenameMetadata: FileFilenameMetadata;
+}
+
+interface PendingFileWrite {
+	file: TFile;
+	result: FileConversionResult;
+}
+
+interface FileFilenameMetadata {
+	readonly needsDate: boolean;
+	getTimestamp(): string;
+}
+
 const DEFAULT_SETTINGS: ConvertBase64ToPNGSettings = {
 	outputFolder: 'attachments',
 	autoConvert: false,
@@ -57,6 +77,9 @@ const DEFAULT_SETTINGS: ConvertBase64ToPNGSettings = {
 };
 
 const BASE64_IMAGE_REGEX = /!\[(.*?)\]\((data:(image\/([a-zA-Z0-9.+-]+));base64,([^)]+))\)/g;
+const DATE_PLACEHOLDER = '{{date}}';
+const INDEX_PLACEHOLDER = '{{index}}';
+const TYPE_PLACEHOLDER = '{{type}}';
 
 class ConversionNoticeReporter {
 	private notice: Notice | null = null;
@@ -187,8 +210,10 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		}
 
 		const reporter = new ConversionNoticeReporter();
-		const result = await this.convertFiles([file], (progress) => reporter.update(progress), async ({ newContent }) => {
-			editor.setValue(newContent);
+		const result = await this.convertFiles([file], (progress) => reporter.update(progress), async ({ newContent }, writtenFile) => {
+			if (this.app.workspace.getActiveFile()?.path === writtenFile.path) {
+				editor.setValue(newContent);
+			}
 		});
 
 		reporter.finish(this.buildCompletionMessage(result, true));
@@ -227,36 +252,54 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		onProgress: (progress: ConversionProgress) => void,
 		onFileConverted?: (result: FileConversionResult, file: TFile) => Promise<void>
 	): Promise<FilesConversionResult> {
-		const fileEntries = await Promise.all(files.map(async (file) => {
+		const totalFiles = files.length;
+		const scannedEntries: ScannedFileEntry[] = [];
+
+		for (let index = 0; index < files.length; index++) {
+			const file = files[index];
+			onProgress({
+				phase: 'scan',
+				processedFiles: index,
+				totalFiles,
+				processedImages: 0,
+				totalImages: 0,
+				currentFile: file.path
+			});
+
 			const content = await this.app.vault.read(file);
 			const matches = this.findBase64Images(content);
-			return { file, content, matches };
-		}));
+			if (matches.length > 0) {
+				scannedEntries.push({
+					file,
+					content,
+					matches,
+					outputFolderPath: this.getOutputFolderPath(file, this.settings.outputFolder),
+					relativeOutputFolderPath: this.getRelativeOutputFolderPath(this.settings.outputFolder),
+					filenameMetadata: this.createFilenameMetadata(this.settings.filenameFormat)
+				});
+			}
+		}
 
-		const totalImages = fileEntries.reduce((sum, entry) => sum + entry.matches.length, 0);
-		const totalFiles = files.length;
+		const totalImages = scannedEntries.reduce((sum, entry) => sum + entry.matches.length, 0);
+		onProgress({
+			phase: 'scan',
+			processedFiles: totalFiles,
+			totalFiles,
+			processedImages: 0,
+			totalImages,
+			currentFile: null
+		});
+
 		let processedFiles = 0;
 		let processedImages = 0;
 		let convertedCount = 0;
 		let skippedCount = 0;
 		const errors: ConversionError[] = [];
+		const folderCache = new Map<string, Promise<void>>();
+		const pendingWrites: PendingFileWrite[] = [];
 
-		for (const entry of fileEntries) {
-			onProgress({
-				phase: 'scan',
-				processedFiles,
-				totalFiles,
-				processedImages,
-				totalImages,
-				currentFile: entry.file.path
-			});
-
-			if (entry.matches.length === 0) {
-				processedFiles++;
-				continue;
-			}
-
-			const result = await this.convertMatchesInContent(entry.content, entry.file, this.settings, (progress) => {
+		for (const entry of scannedEntries) {
+			const result = await this.convertMatchesInContent(entry, this.settings, folderCache, (progress) => {
 				onProgress({
 					...progress,
 					processedFiles,
@@ -267,21 +310,11 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 				});
 			});
 
-			if (result.convertedCount > 0) {
-				onProgress({
-					phase: 'write',
-					processedFiles,
-					totalFiles,
-					processedImages: processedImages + result.convertedCount + result.skippedCount,
-					totalImages,
-					currentFile: entry.file.path
+			if (result.changed) {
+				pendingWrites.push({
+					file: entry.file,
+					result
 				});
-
-				if (onFileConverted) {
-					await onFileConverted(result, entry.file);
-				} else {
-					await this.app.vault.modify(entry.file, result.newContent);
-				}
 			}
 
 			processedFiles++;
@@ -291,9 +324,26 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			errors.push(...result.errors);
 		}
 
+		for (let index = 0; index < pendingWrites.length; index++) {
+			const pendingWrite = pendingWrites[index];
+			onProgress({
+				phase: 'write',
+				processedFiles: index,
+				totalFiles: pendingWrites.length,
+				processedImages,
+				totalImages,
+				currentFile: pendingWrite.file.path
+			});
+
+			await this.app.vault.modify(pendingWrite.file, pendingWrite.result.newContent);
+			if (onFileConverted) {
+				await onFileConverted(pendingWrite.result, pendingWrite.file);
+			}
+		}
+
 		onProgress({
 			phase: 'complete',
-			processedFiles,
+			processedFiles: totalFiles,
 			totalFiles,
 			processedImages,
 			totalImages,
@@ -301,7 +351,7 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		});
 
 		return {
-			processedFiles,
+			processedFiles: totalFiles,
 			totalFiles,
 			convertedCount,
 			skippedCount,
@@ -311,30 +361,29 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 	}
 
 	private async convertMatchesInContent(
-		content: string,
-		file: TFile,
+		entry: ScannedFileEntry,
 		settings: ConvertBase64ToPNGSettings,
+		folderCache: Map<string, Promise<void>>,
 		onProgress: (progress: ConversionProgress) => void
 	): Promise<FileConversionResult> {
-		const matches = this.findBase64Images(content);
+		const { content, file, matches, outputFolderPath, relativeOutputFolderPath, filenameMetadata } = entry;
 		if (matches.length === 0) {
 			return {
 				newContent: content,
 				convertedCount: 0,
 				skippedCount: 0,
 				errors: [],
-				totalMatches: 0
+				totalMatches: 0,
+				changed: false
 			};
 		}
 
-		const outputFolderPath = this.getOutputFolderPath(file, settings.outputFolder);
-		await this.ensureFolderExists(outputFolderPath);
+		await this.ensureFolderExistsCached(outputFolderPath, folderCache);
 
 		const replacements: Array<{ start: number; end: number; replacement: string }> = [];
 		const errors: ConversionError[] = [];
 		let convertedCount = 0;
 		let skippedCount = 0;
-		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
 
 		for (let index = 0; index < matches.length; index++) {
 			const match = matches[index];
@@ -348,9 +397,15 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			});
 
 			try {
-				const filename = this.buildImageFilename(settings.filenameFormat, timestamp, index + 1, match.imageType);
+				const filename = await this.createUniqueImageFilename(
+					outputFolderPath,
+					settings.filenameFormat,
+					filenameMetadata,
+					index + 1,
+					match
+				);
 				const imagePath = normalizePath(`${outputFolderPath}/${filename}`);
-				const relativeImagePath = normalizePath(`${settings.outputFolder}/${filename}`);
+				const relativeImagePath = normalizePath(`${relativeOutputFolderPath}/${filename}`);
 				const binaryData = base64ToArrayBuffer(match.base64Payload);
 
 				await this.app.vault.adapter.writeBinary(imagePath, binaryData);
@@ -387,15 +442,36 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			convertedCount,
 			skippedCount,
 			errors,
-			totalMatches: matches.length
+			totalMatches: matches.length,
+			changed: replacements.length > 0
 		};
 	}
 
-	private buildImageFilename(format: string, timestamp: string, index: number, imageType: string): string {
+	private buildImageFilename(format: string, timestamp: string | null, index: number, imageType: string): string {
 		return format
-			.replace('{{date}}', timestamp)
-			.replace('{{index}}', index.toString())
-			.replace('{{type}}', imageType) + '.png';
+			.split(DATE_PLACEHOLDER).join(timestamp ?? '')
+			.split(INDEX_PLACEHOLDER).join(index.toString())
+			.split(TYPE_PLACEHOLDER).join(imageType) + '.png';
+	}
+
+	private createFilenameMetadata(format: string): FileFilenameMetadata {
+		let timestamp: string | null = null;
+		const needsDate = format.includes(DATE_PLACEHOLDER);
+
+		return {
+			needsDate,
+			getTimestamp: () => {
+				if (!needsDate) {
+					return '';
+				}
+
+				if (!timestamp) {
+					timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+				}
+
+				return timestamp;
+			}
+		};
 	}
 
 	private getOutputFolderPath(file: TFile, outputFolder: string): string {
@@ -404,12 +480,74 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		return normalizePath(fileDir ? `${fileDir}/${outputFolder}` : outputFolder);
 	}
 
+	private getRelativeOutputFolderPath(outputFolder: string): string {
+		return normalizePath(outputFolder);
+	}
+
+	private async ensureFolderExistsCached(folderPath: string, folderCache: Map<string, Promise<void>>) {
+		const existingOperation = folderCache.get(folderPath);
+		if (existingOperation) {
+			await existingOperation;
+			return;
+		}
+
+		const operation = this.ensureFolderExists(folderPath);
+		folderCache.set(folderPath, operation);
+		await operation;
+	}
+
 	private async ensureFolderExists(folderPath: string) {
 		if (await this.app.vault.adapter.exists(folderPath)) {
 			return;
 		}
 
 		await this.app.vault.adapter.mkdir(folderPath);
+	}
+
+	private async createUniqueImageFilename(
+		outputFolderPath: string,
+		format: string,
+		filenameMetadata: FileFilenameMetadata,
+		index: number,
+		match: Base64ImageMatch
+	): Promise<string> {
+		const timestamp = filenameMetadata.needsDate ? filenameMetadata.getTimestamp() : null;
+		const baseFilename = this.buildImageFilename(format, timestamp, index, match.imageType);
+		const contentHash = this.computeContentHash(match.base64Payload);
+		const filenameWithHash = this.appendFilenameSuffix(baseFilename, contentHash);
+
+		if (!(await this.app.vault.adapter.exists(normalizePath(`${outputFolderPath}/${filenameWithHash}`)))) {
+			return filenameWithHash;
+		}
+
+		let attempt = 2;
+		while (true) {
+			const candidateFilename = this.appendFilenameSuffix(baseFilename, `${contentHash}-${attempt}`);
+			const candidatePath = normalizePath(`${outputFolderPath}/${candidateFilename}`);
+			if (!(await this.app.vault.adapter.exists(candidatePath))) {
+				return candidateFilename;
+			}
+			attempt++;
+		}
+	}
+
+	private appendFilenameSuffix(filename: string, suffix: string): string {
+		const extensionIndex = filename.lastIndexOf('.');
+		if (extensionIndex === -1) {
+			return `${filename}-${suffix}`;
+		}
+
+		return `${filename.slice(0, extensionIndex)}-${suffix}${filename.slice(extensionIndex)}`;
+	}
+
+	private computeContentHash(base64Payload: string): string {
+		let hash = 2166136261;
+		for (let index = 0; index < base64Payload.length; index++) {
+			hash ^= base64Payload.charCodeAt(index);
+			hash = Math.imul(hash, 16777619);
+		}
+
+		return (hash >>> 0).toString(16).padStart(8, '0');
 	}
 
 	private applyReplacements(content: string, replacements: Array<{ start: number; end: number; replacement: string }>): string {
