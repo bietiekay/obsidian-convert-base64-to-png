@@ -4,6 +4,9 @@ interface ConvertBase64ToPNGSettings {
 	outputFolder: string;
 	autoConvert: boolean;
 	filenameFormat: string;
+	linkStyle: 'markdown' | 'wikilink';
+	defaultImageSize: string;
+	preserveAltText: boolean;
 }
 
 interface Base64ImageMatch {
@@ -73,13 +76,39 @@ interface FileFilenameMetadata {
 const DEFAULT_SETTINGS: ConvertBase64ToPNGSettings = {
 	outputFolder: 'attachments',
 	autoConvert: false,
-	filenameFormat: 'image-{{date}}-{{index}}'
+	filenameFormat: 'image-{{date}}-{{index}}',
+	linkStyle: 'markdown',
+	defaultImageSize: '',
+	preserveAltText: true
 };
 
 const BASE64_IMAGE_REGEX = /!\[(.*?)\]\((data:(image\/([a-zA-Z0-9.+-]+));base64,([^)]+))\)/g;
 const DATE_PLACEHOLDER = '{{date}}';
 const INDEX_PLACEHOLDER = '{{index}}';
 const TYPE_PLACEHOLDER = '{{type}}';
+
+function normalizeImageSize(size?: string): string | undefined {
+	const normalizedSize = size?.trim();
+	return normalizedSize ? normalizedSize : undefined;
+}
+
+function formatImageReference(
+	relativePath: string,
+	altText: string,
+	linkStyle: ConvertBase64ToPNGSettings['linkStyle'],
+	size?: string,
+	preserveAltText = true
+): string {
+	const normalizedPath = normalizePath(relativePath);
+	const normalizedSize = normalizeImageSize(size);
+
+	if (linkStyle === 'wikilink') {
+		return normalizedSize ? `![[${normalizedPath}|${normalizedSize}]]` : `![[${normalizedPath}]]`;
+	}
+
+	const markdownAltText = preserveAltText ? altText : '';
+	return `![${markdownAltText}](${normalizedPath})`;
+}
 
 class ConversionNoticeReporter {
 	private notice: Notice | null = null;
@@ -412,7 +441,13 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 				replacements.push({
 					start: match.start,
 					end: match.end,
-					replacement: `![${match.altText}](${relativeImagePath})`
+					replacement: formatImageReference(
+						relativeImagePath,
+						match.altText,
+						settings.linkStyle,
+						settings.defaultImageSize,
+						settings.preserveAltText
+					)
 				});
 				convertedCount++;
 			} catch (error) {
@@ -612,6 +647,41 @@ class ConvertBase64ToPNGSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.filenameFormat)
 				.onChange(async (value) => {
 					this.plugin.settings.filenameFormat = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Link style')
+			.setDesc('Choose how converted images are written. Markdown keeps optional alt text as `![alt](attachments/image.png)`. Wikilink uses Obsidian embeds such as `![[attachments/image.png]]` or `![[attachments/image.png|300]]`.')
+			.addDropdown(dropdown => dropdown
+				.addOption('markdown', 'Markdown image link')
+				.addOption('wikilink', 'Obsidian wikilink embed')
+				.setValue(this.plugin.settings.linkStyle)
+				.onChange(async (value: 'markdown' | 'wikilink') => {
+					this.plugin.settings.linkStyle = value;
+					await this.plugin.saveSettings();
+					this.display();
+				}));
+
+		new Setting(containerEl)
+			.setName('Default image size')
+			.setDesc('Optional size suffix for wikilink output, for example `300` to generate `![[attachments/image.png|300]]`. Leave blank to omit size. This setting is ignored for Markdown links because standard Markdown image syntax has no built-in size field.')
+			.addText(text => text
+				.setPlaceholder('300')
+				.setValue(this.plugin.settings.defaultImageSize)
+				.onChange(async (value) => {
+					this.plugin.settings.defaultImageSize = value.trim();
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Preserve alt text in Markdown')
+			.setDesc('When enabled, Markdown output keeps the original alt text as `![alt](attachments/image.png)`. Wikilink mode currently ignores alt text because Obsidian embeds do not have a separate alt-text field.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.preserveAltText)
+				.setDisabled(this.plugin.settings.linkStyle !== 'markdown')
+				.onChange(async (value) => {
+					this.plugin.settings.preserveAltText = value;
 					await this.plugin.saveSettings();
 				}));
 

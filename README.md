@@ -11,6 +11,7 @@ This plugin for [Obsidian](https://obsidian.md) converts base64-encoded images i
 - **Local Conversion**: Converts base64 images to local PNG files
 - **Batch Processing**: Process individual files or all files in your vault
 - **Customizable Storage**: Configure where and how PNG files are stored
+- **Flexible Output Links**: Generate standard Markdown image links or Obsidian wikilink embeds
 - **Automatic Conversion**: Option to automatically convert base64 images when pasting
 
 ## How It Works
@@ -24,6 +25,16 @@ When you run the plugin:
 
 This makes your notes smaller, more portable, and easier to work with.
 
+## Output examples
+
+The plugin can rewrite converted images using either Markdown image syntax or Obsidian wikilinks:
+
+- **Markdown output**: `![alt](attachments/image.png)`
+- **Wikilink output**: `![[attachments/image.png]]`
+- **Wikilink with default size**: `![[attachments/image.png|300]]`
+
+Alt text is preserved only for Markdown output. In wikilink mode the plugin currently ignores alt text because Obsidian embeds do not expose a separate alt-text field in the generated syntax.
+
 
 
 ## Settings
@@ -33,6 +44,20 @@ This makes your notes smaller, more portable, and easier to work with.
 - **Auto Convert**: Automatically convert base64 images when pasting
 - **Output Folder**: Folder where PNG files will be saved (relative to the note)
 - **Filename Format**: Format for generated filenames with placeholders for date, index, and image type
+- **Link Style**: Choose between Markdown image links and Obsidian wikilink embeds
+- **Default Image Size**: Optional size used for wikilink embeds, such as `300` for `![[attachments/image.png|300]]`
+- **Preserve Alt Text in Markdown**: Keep original alt text in Markdown output; wikilink mode ignores alt text for now
+
+### Link style behavior
+
+- **Markdown image link**
+  - Example output: `![Diagram](attachments/image.png)`
+  - Uses the original image alt text by default
+  - Ignores the default image size setting
+- **Obsidian wikilink embed**
+  - Example output without size: `![[attachments/image.png]]`
+  - Example output with size: `![[attachments/image.png|300]]`
+  - Ignores alt text because wikilinks do not have a direct alt-text slot in this plugin yet
 
 ## Commands
 
