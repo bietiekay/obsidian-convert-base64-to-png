@@ -2,6 +2,15 @@
 
 This plugin for [Obsidian](https://obsidian.md) converts inline base64-encoded image data in your notes to local image files. It keeps the original image bytes, preserves the source file extension inferred from the data URI, and rewrites your note to point at the extracted file instead of the embedded base64 payload.
 
+## Fork notice
+
+This repository is a fork and extension of the original **Convert Base64 to PNG** plugin by **Nykko Lin**.
+
+- Original author: **Nykko Lin**
+- Fork and extended version maintained by: **bietiekay - schrankmonster.de**
+
+This fork retains the original copyright and license notices and builds on the original plugin with additional functionality and maintenance updates.
+
 ## Demo
 ![Demo](screenshots/demo.gif)
 
@@ -23,6 +32,7 @@ When you run the plugin:
 2. Decodes the base64 data to binary
 3. Saves the binary data as a local file in your configured folder, using an extension that matches the source MIME subtype when possible
 4. Updates the links in your notes to point to the extracted local image files
+5. When auto-convert is enabled for paste operations, it first inspects the pasted clipboard payload and only converts the newly inserted pasted range when inline base64 image markdown is actually present
 
 This makes your notes smaller, more portable, and easier to work with.
 
@@ -34,7 +44,7 @@ The plugin does **not** transcode non-PNG images into PNG. For example:
 
 If explicit transcoding is added later, it would need to be implemented as a separate processing step. The current behavior is to preserve the original image data exactly as provided in the note.
 
-When auto-convert is enabled, the paste handler is optimized for pasted inline base64 image markdown. It inspects the clipboard payload first and only converts the newly inserted pasted range when that payload actually contains inline base64 image markdown.
+When auto-convert is enabled, the paste handler is optimized for pasted inline base64 image markdown so ordinary pastes avoid unnecessary full-note rescans.
 
 ## Output examples
 
