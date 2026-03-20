@@ -19,7 +19,7 @@ interface Base64ImageMatch {
 	originalText: string;
 }
 
-type ConversionPhase = 'scan' | 'convert' | 'write' | 'complete';
+type ConversionPhase = 'scan' | 'convert' | 'write' | 'complete' | 'cancelled';
 
 interface ConversionProgress {
 	phase: ConversionPhase;
@@ -52,6 +52,7 @@ interface FilesConversionResult {
 	skippedCount: number;
 	totalMatches: number;
 	errors: ConversionError[];
+	cancelled: boolean;
 }
 
 interface ScannedFileEntry {
@@ -86,6 +87,7 @@ const BASE64_IMAGE_REGEX = /!\[(.*?)\]\((data:(image\/([a-zA-Z0-9.+-]+));base64,
 const DATE_PLACEHOLDER = '{{date}}';
 const INDEX_PLACEHOLDER = '{{index}}';
 const TYPE_PLACEHOLDER = '{{type}}';
+const FINAL_STATUS_TIMEOUT_MS = 10000;
 
 function normalizeImageSize(size?: string): string | undefined {
 	const normalizedSize = size?.trim();
@@ -110,40 +112,124 @@ function formatImageReference(
 	return `![${markdownAltText}](${normalizedPath})`;
 }
 
-class ConversionNoticeReporter {
-	private notice: Notice | null = null;
+class ConversionCancellationController {
+	private cancellationRequested = false;
+
+	requestCancel() {
+		this.cancellationRequested = true;
+	}
+
+	get isCancellationRequested(): boolean {
+		return this.cancellationRequested;
+	}
+}
+
+class ConversionProgressDisplay {
+	private readonly statusBarEl: HTMLElement;
+	private readonly messageEl: HTMLSpanElement;
+	private readonly cancelButtonEl: HTMLButtonElement | null;
+	private finalStatusTimeoutId: number | null = null;
+	private cancellationRequested = false;
+
+	constructor(
+		plugin: Plugin,
+		private readonly options: {
+			allowCancel: boolean;
+			onCancel?: () => void;
+			label: string;
+		}
+	) {
+		this.statusBarEl = plugin.addStatusBarItem();
+		this.statusBarEl.addClass('convert-base64-to-png-status');
+		this.statusBarEl.style.display = 'flex';
+		this.statusBarEl.style.alignItems = 'center';
+		this.statusBarEl.style.gap = '0.5rem';
+
+		this.messageEl = this.statusBarEl.createEl('span');
+		this.messageEl.setText(`${this.options.label}: Preparing…`);
+
+		if (this.options.allowCancel) {
+			this.cancelButtonEl = this.statusBarEl.createEl('button', { text: 'Cancel' });
+			this.cancelButtonEl.type = 'button';
+			this.cancelButtonEl.addEventListener('click', () => {
+				if (this.cancellationRequested) {
+					return;
+				}
+
+				this.cancellationRequested = true;
+				this.cancelButtonEl?.setText('Cancelling…');
+				this.cancelButtonEl?.setAttribute('disabled', 'true');
+				this.options.onCancel?.();
+				this.renderSuffix();
+			});
+		} else {
+			this.cancelButtonEl = null;
+		}
+	}
 
 	update(progress: ConversionProgress) {
-		const message = this.formatProgress(progress);
-		if (!this.notice) {
-			this.notice = new Notice(message, 0);
+		this.clearFinalStatusTimeout();
+		this.messageEl.setText(this.formatProgress(progress));
+		this.renderSuffix();
+	}
+
+	finish(summary: string, cancelled: boolean) {
+		this.clearFinalStatusTimeout();
+		this.messageEl.setText(summary);
+
+		if (this.cancelButtonEl) {
+			if (cancelled) {
+				this.cancelButtonEl.setText('Cancelled');
+			} else {
+				this.cancelButtonEl.setText('Done');
+			}
+			this.cancelButtonEl.setAttribute('disabled', 'true');
+		}
+
+		this.finalStatusTimeoutId = window.setTimeout(() => {
+			this.destroy();
+		}, FINAL_STATUS_TIMEOUT_MS);
+	}
+
+	destroy() {
+		this.clearFinalStatusTimeout();
+		this.statusBarEl.remove();
+	}
+
+	private renderSuffix() {
+		if (!this.cancellationRequested) {
 			return;
 		}
 
-		this.notice.setMessage(message);
+		const currentText = this.messageEl.getText();
+		if (!currentText.includes('Stopping after current file…')) {
+			this.messageEl.setText(`${currentText} • Stopping after current file…`);
+		}
 	}
 
-	finish(message: string) {
-		if (this.notice) {
-			this.notice.hide();
-			this.notice = null;
+	private clearFinalStatusTimeout() {
+		if (this.finalStatusTimeoutId !== null) {
+			window.clearTimeout(this.finalStatusTimeoutId);
+			this.finalStatusTimeoutId = null;
 		}
-
-		new Notice(message);
 	}
 
 	private formatProgress(progress: ConversionProgress): string {
-		const fileLabel = progress.currentFile ? ` (${progress.currentFile})` : '';
+		const fileSummary = `files ${progress.processedFiles}/${progress.totalFiles}`;
+		const imageSummary = `images ${progress.processedImages}/${progress.totalImages}`;
+		const currentFile = progress.currentFile ? ` • ${progress.currentFile}` : '';
 
 		switch (progress.phase) {
 			case 'scan':
-				return `Scanning files ${progress.processedFiles}/${progress.totalFiles}${fileLabel}`;
+				return `${this.options.label}: Scanning… • ${fileSummary} • ${imageSummary}${currentFile}`;
 			case 'convert':
-				return `Converting images ${progress.processedImages}/${progress.totalImages}; files ${progress.processedFiles}/${progress.totalFiles}${fileLabel}`;
+				return `${this.options.label}: Converting… • ${fileSummary} • ${imageSummary}${currentFile}`;
 			case 'write':
-				return `Writing updates for ${progress.currentFile ?? 'file'} (${progress.processedFiles}/${progress.totalFiles})`;
+				return `${this.options.label}: Saving… • ${fileSummary} • ${imageSummary}${currentFile}`;
 			case 'complete':
-				return `Completed ${progress.processedFiles}/${progress.totalFiles} files and ${progress.processedImages}/${progress.totalImages} images`;
+				return `${this.options.label}: Complete • ${fileSummary} • ${imageSummary}${currentFile}`;
+			case 'cancelled':
+				return `${this.options.label}: Cancelled • ${fileSummary} • ${imageSummary}${currentFile}`;
 		}
 	}
 }
@@ -238,51 +324,85 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			return;
 		}
 
-		const reporter = new ConversionNoticeReporter();
-		const result = await this.convertFiles([file], (progress) => reporter.update(progress), async ({ newContent }, writtenFile) => {
-			if (this.app.workspace.getActiveFile()?.path === writtenFile.path) {
-				editor.setValue(newContent);
-			}
+		const display = new ConversionProgressDisplay(this, {
+			allowCancel: false,
+			label: 'Base64 → PNG'
 		});
 
-		reporter.finish(this.buildCompletionMessage(result, true));
+		try {
+			const result = await this.convertFiles([file], (progress) => display.update(progress), async ({ newContent }, writtenFile) => {
+				if (this.app.workspace.getActiveFile()?.path === writtenFile.path) {
+					editor.setValue(newContent);
+				}
+			});
+
+			const summary = this.buildCompletionMessage(result, true);
+			display.finish(summary, result.cancelled);
+			new Notice(summary);
+		} catch (error) {
+			display.destroy();
+			throw error;
+		}
 	}
 
 	private async runAllFilesConversion() {
 		const files = this.app.vault.getMarkdownFiles();
-		const reporter = new ConversionNoticeReporter();
-		const result = await this.convertFiles(files, (progress) => reporter.update(progress));
+		const cancellationController = new ConversionCancellationController();
+		const display = new ConversionProgressDisplay(this, {
+			allowCancel: true,
+			onCancel: () => cancellationController.requestCancel(),
+			label: 'Base64 → PNG'
+		});
 
-		reporter.finish(this.buildCompletionMessage(result, false));
+		try {
+			const result = await this.convertFiles(files, (progress) => display.update(progress), undefined, cancellationController);
+			const summary = this.buildCompletionMessage(result, false);
+			display.finish(summary, result.cancelled);
+			new Notice(summary);
+		} catch (error) {
+			display.destroy();
+			throw error;
+		}
 	}
 
 	private buildCompletionMessage(result: FilesConversionResult, isCurrentFile: boolean): string {
 		if (result.totalMatches === 0) {
+			if (result.cancelled) {
+				return isCurrentFile
+					? 'Conversion cancelled before any base64 images were processed'
+					: `Vault-wide conversion cancelled after scanning ${result.processedFiles}/${result.totalFiles} files; no base64 images were processed`;
+			}
+
 			return isCurrentFile ? 'No base64 images found in the current file' : 'No base64 images found in markdown files';
 		}
 
-		const baseMessage = isCurrentFile
-			? `Converted ${result.convertedCount} base64 image${result.convertedCount !== 1 ? 's' : ''}`
-			: `Completed! Converted ${result.convertedCount} base64 image${result.convertedCount !== 1 ? 's' : ''} across ${result.totalFiles} file${result.totalFiles !== 1 ? 's' : ''}`;
+		const failedImageCount = result.errors.length;
+		const failedFileCount = new Set(result.errors.map((error) => error.filePath)).size;
+		const baseMessage = result.cancelled
+			? `Conversion cancelled after processing ${result.processedFiles}/${result.totalFiles} file${result.totalFiles !== 1 ? 's' : ''}`
+			: isCurrentFile
+				? `Converted ${result.convertedCount} base64 image${result.convertedCount !== 1 ? 's' : ''} in the current file`
+				: `Completed vault-wide conversion across ${result.processedFiles}/${result.totalFiles} file${result.totalFiles !== 1 ? 's' : ''}`;
 
-		const details: string[] = [];
-		if (result.skippedCount > 0) {
-			details.push(`skipped ${result.skippedCount}`);
-		}
-		if (result.errors.length > 0) {
-			details.push(`${result.errors.length} error${result.errors.length !== 1 ? 's' : ''}`);
-		}
+		const details = [
+			`${result.convertedCount} converted image${result.convertedCount !== 1 ? 's' : ''}`,
+			`${result.skippedCount} skipped image${result.skippedCount !== 1 ? 's' : ''}`,
+			`${failedImageCount} failed image${failedImageCount !== 1 ? 's' : ''}`,
+			`${failedFileCount} failed file${failedFileCount !== 1 ? 's' : ''}`
+		];
 
-		return details.length > 0 ? `${baseMessage} (${details.join(', ')})` : baseMessage;
+		return `${baseMessage} (${details.join(', ')})`;
 	}
 
 	private async convertFiles(
 		files: TFile[],
 		onProgress: (progress: ConversionProgress) => void,
-		onFileConverted?: (result: FileConversionResult, file: TFile) => Promise<void>
+		onFileConverted?: (result: FileConversionResult, file: TFile) => Promise<void>,
+		cancellationController?: ConversionCancellationController
 	): Promise<FilesConversionResult> {
 		const totalFiles = files.length;
 		const scannedEntries: ScannedFileEntry[] = [];
+		let scannedFiles = 0;
 
 		for (let index = 0; index < files.length; index++) {
 			const file = files[index];
@@ -307,12 +427,17 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 					filenameMetadata: this.createFilenameMetadata(this.settings.filenameFormat)
 				});
 			}
+
+			scannedFiles = index + 1;
+			if (cancellationController?.isCancellationRequested) {
+				break;
+			}
 		}
 
 		const totalImages = scannedEntries.reduce((sum, entry) => sum + entry.matches.length, 0);
 		onProgress({
-			phase: 'scan',
-			processedFiles: totalFiles,
+			phase: cancellationController?.isCancellationRequested ? 'cancelled' : 'scan',
+			processedFiles: scannedFiles,
 			totalFiles,
 			processedImages: 0,
 			totalImages,
@@ -326,6 +451,7 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		const errors: ConversionError[] = [];
 		const folderCache = new Map<string, Promise<void>>();
 		const pendingWrites: PendingFileWrite[] = [];
+		let cancelled = cancellationController?.isCancellationRequested ?? false;
 
 		for (const entry of scannedEntries) {
 			const result = await this.convertMatchesInContent(entry, this.settings, folderCache, (progress) => {
@@ -351,14 +477,19 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			convertedCount += result.convertedCount;
 			skippedCount += result.skippedCount;
 			errors.push(...result.errors);
+
+			if (cancellationController?.isCancellationRequested) {
+				cancelled = true;
+				break;
+			}
 		}
 
 		for (let index = 0; index < pendingWrites.length; index++) {
 			const pendingWrite = pendingWrites[index];
 			onProgress({
 				phase: 'write',
-				processedFiles: index,
-				totalFiles: pendingWrites.length,
+				processedFiles,
+				totalFiles,
 				processedImages,
 				totalImages,
 				currentFile: pendingWrite.file.path
@@ -371,8 +502,8 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		}
 
 		onProgress({
-			phase: 'complete',
-			processedFiles: totalFiles,
+			phase: cancelled ? 'cancelled' : 'complete',
+			processedFiles,
 			totalFiles,
 			processedImages,
 			totalImages,
@@ -380,12 +511,13 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		});
 
 		return {
-			processedFiles: totalFiles,
+			processedFiles,
 			totalFiles,
 			convertedCount,
 			skippedCount,
 			totalMatches: totalImages,
-			errors
+			errors,
+			cancelled
 		};
 	}
 
