@@ -1,4 +1,4 @@
-import { App, Editor, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath, base64ToArrayBuffer } from 'obsidian';
+import { App, Editor, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, TFile, base64ToArrayBuffer, normalizePath } from 'obsidian';
 
 interface ConvertBase64ToPNGSettings {
 	outputFolder: string;
@@ -6,10 +6,94 @@ interface ConvertBase64ToPNGSettings {
 	filenameFormat: string;
 }
 
+interface Base64ImageMatch {
+	start: number;
+	end: number;
+	altText: string;
+	mimeType: string;
+	imageType: string;
+	base64Payload: string;
+	originalText: string;
+}
+
+type ConversionPhase = 'scan' | 'convert' | 'write' | 'complete';
+
+interface ConversionProgress {
+	phase: ConversionPhase;
+	processedFiles: number;
+	totalFiles: number;
+	processedImages: number;
+	totalImages: number;
+	currentFile: string | null;
+}
+
+interface ConversionError {
+	filePath: string;
+	message: string;
+	match?: Base64ImageMatch;
+}
+
+interface FileConversionResult {
+	newContent: string;
+	convertedCount: number;
+	skippedCount: number;
+	errors: ConversionError[];
+	totalMatches: number;
+}
+
+interface FilesConversionResult {
+	processedFiles: number;
+	totalFiles: number;
+	convertedCount: number;
+	skippedCount: number;
+	totalMatches: number;
+	errors: ConversionError[];
+}
+
 const DEFAULT_SETTINGS: ConvertBase64ToPNGSettings = {
 	outputFolder: 'attachments',
 	autoConvert: false,
 	filenameFormat: 'image-{{date}}-{{index}}'
+};
+
+const BASE64_IMAGE_REGEX = /!\[(.*?)\]\((data:(image\/([a-zA-Z0-9.+-]+));base64,([^)]+))\)/g;
+
+class ConversionNoticeReporter {
+	private notice: Notice | null = null;
+
+	update(progress: ConversionProgress) {
+		const message = this.formatProgress(progress);
+		if (!this.notice) {
+			this.notice = new Notice(message, 0);
+			return;
+		}
+
+		this.notice.setMessage(message);
+	}
+
+	finish(message: string) {
+		if (this.notice) {
+			this.notice.hide();
+			this.notice = null;
+		}
+
+		new Notice(message);
+	}
+
+	private formatProgress(progress: ConversionProgress): string {
+		const fileLabel = progress.currentFile ? ` (${progress.currentFile})` : '';
+
+		switch (progress.phase) {
+			case 'scan':
+				return `Scanning files ${progress.processedFiles}/${progress.totalFiles}${fileLabel}`;
+			case 'convert':
+				return `Converting images ${progress.processedImages}/${progress.totalImages}; files ${progress.processedFiles}/${progress.totalFiles}${fileLabel}`;
+			case 'write':
+				return `Writing updates for ${progress.currentFile ?? 'file'} (${progress.processedFiles}/${progress.totalFiles})`;
+			case 'complete':
+				return `Completed ${progress.processedFiles}/${progress.totalFiles} files and ${progress.processedImages}/${progress.totalImages} images`;
+		}
+	}
 }
 
 export default class ConvertBase64ToPNGPlugin extends Plugin {
@@ -18,36 +102,31 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		// Add command to convert base64 images in current file
 		this.addCommand({
 			id: 'convert-base64-to-png-current-file',
 			name: 'Convert Base64 images to PNG for current file',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				this.convertBase64ToPNG(editor, view.file);
+			editorCallback: async (editor: Editor, view: MarkdownView) => {
+				await this.runCurrentFileConversion(editor, view.file);
 			}
 		});
 
-		// Add command to convert base64 images in all files
 		this.addCommand({
 			id: 'convert-base64-to-png-all-files',
 			name: 'Convert Base64 images to PNG for all files',
-			callback: () => {
-				this.convertAllFilesBase64ToPNG();
+			callback: async () => {
+				await this.runAllFilesConversion();
 			}
 		});
 
-		// Add settings tab
 		this.addSettingTab(new ConvertBase64ToPNGSettingTab(this.app, this));
 
-		// Register event for auto-conversion if enabled
 		if (this.settings.autoConvert) {
 			this.registerEvent(
 				this.app.workspace.on('editor-paste', (_: ClipboardEvent, editor: Editor) => {
-					// Check if pasted content contains base64 image
 					setTimeout(() => {
 						const content = editor.getValue();
 						if (this.containsBase64Image(content)) {
-							this.convertBase64ToPNG(editor, this.app.workspace.getActiveFile());
+							void this.runCurrentFileConversion(editor, this.app.workspace.getActiveFile());
 						}
 					}, 100);
 				})
@@ -67,192 +146,289 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	// Check if content contains base64 image
 	containsBase64Image(content: string): boolean {
-		const base64Regex = /!\[.*?\]\(data:image\/[a-zA-Z]+;base64,([^)]+)\)/g;
-		return base64Regex.test(content);
+		return this.findBase64Images(content).length > 0;
 	}
 
-	// Convert base64 images in current file
+	findBase64Images(content: string): Base64ImageMatch[] {
+		const matches: Base64ImageMatch[] = [];
+		let match: RegExpExecArray | null;
+
+		BASE64_IMAGE_REGEX.lastIndex = 0;
+		while ((match = BASE64_IMAGE_REGEX.exec(content)) !== null) {
+			matches.push({
+				start: match.index,
+				end: match.index + match[0].length,
+				altText: match[1],
+				mimeType: match[2],
+				imageType: match[3],
+				base64Payload: match[4],
+				originalText: match[0]
+			});
+		}
+
+		return matches;
+	}
+
 	async convertCurrentFileBase64ToPNG() {
 		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (activeView) {
-			const editor = activeView.editor;
-			const file = activeView.file;
-			await this.convertBase64ToPNG(editor, file);
-		} else {
+		if (!activeView) {
 			new Notice('No active markdown file');
+			return;
 		}
+
+		await this.runCurrentFileConversion(activeView.editor, activeView.file);
 	}
 
-	// Main conversion function
-	async convertBase64ToPNG(editor: Editor, file: TFile | null) {
+	private async runCurrentFileConversion(editor: Editor, file: TFile | null) {
 		if (!file) {
 			new Notice('No file is currently open');
 			return;
 		}
 
-		const content = editor.getValue();
-		const base64Regex = /!\[(.*?)\]\(data:image\/([a-zA-Z]+);base64,([^)]+)\)/g;
+		const reporter = new ConversionNoticeReporter();
+		const result = await this.convertFiles([file], (progress) => reporter.update(progress), async ({ newContent }) => {
+			editor.setValue(newContent);
+		});
 
-		let match;
-		let newContent = content;
-		let conversionCount = 0;
-		const matches = [];
+		reporter.finish(this.buildCompletionMessage(result, true));
+	}
 
-		// Find all matches first
-		while ((match = base64Regex.exec(content)) !== null) {
-			matches.push({
-				fullMatch: match[0],
-				altText: match[1],
-				imageType: match[2],
-				base64Data: match[3]
-			});
+	private async runAllFilesConversion() {
+		const files = this.app.vault.getMarkdownFiles();
+		const reporter = new ConversionNoticeReporter();
+		const result = await this.convertFiles(files, (progress) => reporter.update(progress));
+
+		reporter.finish(this.buildCompletionMessage(result, false));
+	}
+
+	private buildCompletionMessage(result: FilesConversionResult, isCurrentFile: boolean): string {
+		if (result.totalMatches === 0) {
+			return isCurrentFile ? 'No base64 images found in the current file' : 'No base64 images found in markdown files';
 		}
 
+		const baseMessage = isCurrentFile
+			? `Converted ${result.convertedCount} base64 image${result.convertedCount !== 1 ? 's' : ''}`
+			: `Completed! Converted ${result.convertedCount} base64 image${result.convertedCount !== 1 ? 's' : ''} across ${result.totalFiles} file${result.totalFiles !== 1 ? 's' : ''}`;
+
+		const details: string[] = [];
+		if (result.skippedCount > 0) {
+			details.push(`skipped ${result.skippedCount}`);
+		}
+		if (result.errors.length > 0) {
+			details.push(`${result.errors.length} error${result.errors.length !== 1 ? 's' : ''}`);
+		}
+
+		return details.length > 0 ? `${baseMessage} (${details.join(', ')})` : baseMessage;
+	}
+
+	private async convertFiles(
+		files: TFile[],
+		onProgress: (progress: ConversionProgress) => void,
+		onFileConverted?: (result: FileConversionResult, file: TFile) => Promise<void>
+	): Promise<FilesConversionResult> {
+		const fileEntries = await Promise.all(files.map(async (file) => {
+			const content = await this.app.vault.read(file);
+			const matches = this.findBase64Images(content);
+			return { file, content, matches };
+		}));
+
+		const totalImages = fileEntries.reduce((sum, entry) => sum + entry.matches.length, 0);
+		const totalFiles = files.length;
+		let processedFiles = 0;
+		let processedImages = 0;
+		let convertedCount = 0;
+		let skippedCount = 0;
+		const errors: ConversionError[] = [];
+
+		for (const entry of fileEntries) {
+			onProgress({
+				phase: 'scan',
+				processedFiles,
+				totalFiles,
+				processedImages,
+				totalImages,
+				currentFile: entry.file.path
+			});
+
+			if (entry.matches.length === 0) {
+				processedFiles++;
+				continue;
+			}
+
+			const result = await this.convertMatchesInContent(entry.content, entry.file, this.settings, (progress) => {
+				onProgress({
+					...progress,
+					processedFiles,
+					totalFiles,
+					processedImages: processedImages + progress.processedImages,
+					totalImages,
+					currentFile: entry.file.path
+				});
+			});
+
+			if (result.convertedCount > 0) {
+				onProgress({
+					phase: 'write',
+					processedFiles,
+					totalFiles,
+					processedImages: processedImages + result.convertedCount + result.skippedCount,
+					totalImages,
+					currentFile: entry.file.path
+				});
+
+				if (onFileConverted) {
+					await onFileConverted(result, entry.file);
+				} else {
+					await this.app.vault.modify(entry.file, result.newContent);
+				}
+			}
+
+			processedFiles++;
+			processedImages += result.totalMatches;
+			convertedCount += result.convertedCount;
+			skippedCount += result.skippedCount;
+			errors.push(...result.errors);
+		}
+
+		onProgress({
+			phase: 'complete',
+			processedFiles,
+			totalFiles,
+			processedImages,
+			totalImages,
+			currentFile: null
+		});
+
+		return {
+			processedFiles,
+			totalFiles,
+			convertedCount,
+			skippedCount,
+			totalMatches: totalImages,
+			errors
+		};
+	}
+
+	private async convertMatchesInContent(
+		content: string,
+		file: TFile,
+		settings: ConvertBase64ToPNGSettings,
+		onProgress: (progress: ConversionProgress) => void
+	): Promise<FileConversionResult> {
+		const matches = this.findBase64Images(content);
 		if (matches.length === 0) {
-			new Notice('No base64 images found in the current file');
+			return {
+				newContent: content,
+				convertedCount: 0,
+				skippedCount: 0,
+				errors: [],
+				totalMatches: 0
+			};
+		}
+
+		const outputFolderPath = this.getOutputFolderPath(file, settings.outputFolder);
+		await this.ensureFolderExists(outputFolderPath);
+
+		const replacements: Array<{ start: number; end: number; replacement: string }> = [];
+		const errors: ConversionError[] = [];
+		let convertedCount = 0;
+		let skippedCount = 0;
+		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+		for (let index = 0; index < matches.length; index++) {
+			const match = matches[index];
+			onProgress({
+				phase: 'convert',
+				processedFiles: 0,
+				totalFiles: 0,
+				processedImages: index,
+				totalImages: matches.length,
+				currentFile: file.path
+			});
+
+			try {
+				const filename = this.buildImageFilename(settings.filenameFormat, timestamp, index + 1, match.imageType);
+				const imagePath = normalizePath(`${outputFolderPath}/${filename}`);
+				const relativeImagePath = normalizePath(`${settings.outputFolder}/${filename}`);
+				const binaryData = base64ToArrayBuffer(match.base64Payload);
+
+				await this.app.vault.adapter.writeBinary(imagePath, binaryData);
+				replacements.push({
+					start: match.start,
+					end: match.end,
+					replacement: `![${match.altText}](${relativeImagePath})`
+				});
+				convertedCount++;
+			} catch (error) {
+				skippedCount++;
+				const message = error instanceof Error ? error.message : String(error);
+				console.error(`Error converting image in file ${file.path}:`, error);
+				errors.push({
+					filePath: file.path,
+					message,
+					match
+				});
+			}
+		}
+
+		const newContent = this.applyReplacements(content, replacements);
+		onProgress({
+			phase: 'convert',
+			processedFiles: 0,
+			totalFiles: 0,
+			processedImages: matches.length,
+			totalImages: matches.length,
+			currentFile: file.path
+		});
+
+		return {
+			newContent,
+			convertedCount,
+			skippedCount,
+			errors,
+			totalMatches: matches.length
+		};
+	}
+
+	private buildImageFilename(format: string, timestamp: string, index: number, imageType: string): string {
+		return format
+			.replace('{{date}}', timestamp)
+			.replace('{{index}}', index.toString())
+			.replace('{{type}}', imageType) + '.png';
+	}
+
+	private getOutputFolderPath(file: TFile, outputFolder: string): string {
+		const lastSlashIndex = file.path.lastIndexOf('/');
+		const fileDir = lastSlashIndex === -1 ? '' : file.path.substring(0, lastSlashIndex);
+		return normalizePath(fileDir ? `${fileDir}/${outputFolder}` : outputFolder);
+	}
+
+	private async ensureFolderExists(folderPath: string) {
+		if (await this.app.vault.adapter.exists(folderPath)) {
 			return;
 		}
 
-		// Create output folder if it doesn't exist
-		const filePath = file.path;
-		const fileDir = filePath.substring(0, filePath.lastIndexOf('/'));
-		const outputFolderPath = normalizePath(`${fileDir}/${this.settings.outputFolder}`);
-
-		try {
-			await this.app.vault.adapter.mkdir(outputFolderPath);
-		} catch (error) {
-			// Folder might already exist, which is fine
-		}
-
-		// Process each match
-		for (let i = 0; i < matches.length; i++) {
-			const match = matches[i];
-
-			try {
-				// Generate filename
-				const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-				const filename = this.settings.filenameFormat
-					.replace('{{date}}', timestamp)
-					.replace('{{index}}', (i + 1).toString())
-					.replace('{{type}}', match.imageType) + '.png';
-
-				const imagePath = normalizePath(`${outputFolderPath}/${filename}`);
-				const relativeImagePath = normalizePath(`${this.settings.outputFolder}/${filename}`);
-
-				// 使用Obsidian API提供的base64ToArrayBuffer
-				const binaryData = base64ToArrayBuffer(match.base64Data);
-				await this.app.vault.adapter.writeBinary(imagePath, binaryData);
-
-				// Replace in content
-				const newImageMarkdown = `![${match.altText}](${relativeImagePath})`;
-				newContent = newContent.replace(match.fullMatch, newImageMarkdown);
-
-				conversionCount++;
-			} catch (error) {
-				console.error('Error converting base64 to PNG:', error);
-				new Notice(`Error converting image ${i + 1}: ${error.message}`);
-			}
-		}
-
-		// Update the file content
-		editor.setValue(newContent);
-
-		new Notice(`Converted ${conversionCount} base64 image${conversionCount !== 1 ? 's' : ''} to PNG`);
+		await this.app.vault.adapter.mkdir(folderPath);
 	}
 
-	// Convert base64 images in all markdown files
-	async convertAllFilesBase64ToPNG() {
-		const files = this.app.vault.getMarkdownFiles();
-		let totalConversions = 0;
-		let processedFiles = 0;
-
-		new Notice(`Processing ${files.length} files...`);
-
-		for (const file of files) {
-			try {
-				// Get file content
-				const content = await this.app.vault.read(file);
-
-				// Check if file contains base64 images
-				if (this.containsBase64Image(content)) {
-					// Count base64 images in the file
-					const base64Regex = /!\[(.*?)\]\(data:image\/([a-zA-Z]+);base64,([^)]+)\)/g;
-					let matches = [];
-					let match;
-					while ((match = base64Regex.exec(content)) !== null) {
-						matches.push(match);
-					}
-
-					// Process the file directly instead of using the editor-based function
-					let newContent = content;
-					let fileConversionCount = 0;
-
-					// Create output folder if it doesn't exist
-					const filePath = file.path;
-					const fileDir = filePath.substring(0, filePath.lastIndexOf('/'));
-					const outputFolderPath = normalizePath(`${fileDir}/${this.settings.outputFolder}`);
-
-					try {
-						await this.app.vault.adapter.mkdir(outputFolderPath);
-					} catch (error) {
-						// Folder might already exist, which is fine
-					}
-
-					// Process each match
-					for (let i = 0; i < matches.length; i++) {
-						const match = {
-							fullMatch: matches[i][0],
-							altText: matches[i][1],
-							imageType: matches[i][2],
-							base64Data: matches[i][3]
-						};
-
-						try {
-							// Generate filename
-							const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-							const filename = this.settings.filenameFormat
-								.replace('{{date}}', timestamp)
-								.replace('{{index}}', (i + 1).toString())
-								.replace('{{type}}', match.imageType) + '.png';
-
-							const imagePath = normalizePath(`${outputFolderPath}/${filename}`);
-							const relativeImagePath = normalizePath(`${this.settings.outputFolder}/${filename}`);
-
-							// 使用Obsidian API提供的base64ToArrayBuffer
-							const binaryData = base64ToArrayBuffer(match.base64Data);
-							await this.app.vault.adapter.writeBinary(imagePath, binaryData);
-
-							// Replace in content
-							const newImageMarkdown = `![${match.altText}](${relativeImagePath})`;
-							newContent = newContent.replace(match.fullMatch, newImageMarkdown);
-
-							fileConversionCount++;
-						} catch (error) {
-							console.error(`Error converting image in file ${file.path}:`, error);
-						}
-					}
-
-					// Update the file content
-					if (fileConversionCount > 0) {
-						await this.app.vault.modify(file, newContent);
-					}
-
-					totalConversions += fileConversionCount;
-				}
-
-				processedFiles++;
-				if (processedFiles % 10 === 0) {
-					new Notice(`Processed ${processedFiles}/${files.length} files...`);
-				}
-			} catch (error) {
-				console.error(`Error processing file ${file.path}:`, error);
-				new Notice(`Error processing file ${file.path}: ${error.message}`);
-			}
+	private applyReplacements(content: string, replacements: Array<{ start: number; end: number; replacement: string }>): string {
+		if (replacements.length === 0) {
+			return content;
 		}
 
-		new Notice(`Completed! Converted ${totalConversions} base64 image${totalConversions !== 1 ? 's' : ''} across ${files.length} files.`);
+		const orderedReplacements = [...replacements].sort((left, right) => left.start - right.start);
+		let cursor = 0;
+		let result = '';
+
+		for (const replacement of orderedReplacements) {
+			result += content.slice(cursor, replacement.start);
+			result += replacement.replacement;
+			cursor = replacement.end;
+		}
+
+		result += content.slice(cursor);
+		return result;
 	}
 }
 
