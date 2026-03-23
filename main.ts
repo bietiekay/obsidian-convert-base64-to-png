@@ -91,8 +91,7 @@ const TYPE_PLACEHOLDER = '{{type}}';
 const FINAL_STATUS_TIMEOUT_MS = 10000;
 const DEFAULT_IMAGE_EXTENSION = 'png';
 const MIME_SUBTYPE_EXTENSION_MAP: Record<string, string> = {
-	'jpeg': 'jpg',
-	'pjpeg': 'jpg',
+	'pjpeg': 'jpeg',
 	'svg+xml': 'svg',
 	'x-icon': 'ico',
 	'vnd.microsoft.icon': 'ico'
@@ -135,10 +134,6 @@ function sanitizeFilenameStem(value: string): string {
 		.replace(/^[-. ]+|[-. ]+$/g, '');
 
 	return sanitized || 'image';
-}
-
-function escapeForRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function getFileDirectory(file: TFile): string {
@@ -451,13 +446,14 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		let match: RegExpExecArray | null;
 
 		while ((match = regex.exec(content)) !== null) {
-			const imageSubtype = match[3];
-			const normalizedPayload = normalizeBase64Payload(match[4]);
+			const mimeType = match[3];
+			const imageSubtype = match[4];
+			const normalizedPayload = normalizeBase64Payload(match[5]);
 			matches.push({
 				start: match.index,
 				end: match.index + match[0].length,
 				altText: match[1],
-				mimeType: match[2],
+				mimeType,
 				imageSubtype,
 				fileExtension: getFileExtensionForMimeSubtype(imageSubtype),
 				base64Payload: normalizedPayload,
@@ -706,6 +702,7 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		await this.ensureFolderExistsCached(outputFolderPath, folderCache);
 
 		const replacements: Array<{ start: number; end: number; replacement: string }> = [];
+		const reservedFilenames = new Set<string>();
 		const errors: ConversionError[] = [];
 		let convertedCount = 0;
 		let skippedCount = 0;
@@ -727,7 +724,8 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 					settings.filenameFormat,
 					filenameMetadata,
 					index + 1,
-					match
+					match,
+					reservedFilenames
 				);
 				const imagePath = normalizePath(`${outputFolderPath}/${filename}`);
 				const relativeImagePath = normalizePath(`${relativeOutputFolderPath}/${filename}`);
@@ -841,52 +839,34 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		format: string,
 		filenameMetadata: FileFilenameMetadata,
 		index: number,
-		match: Base64ImageMatch
+		match: Base64ImageMatch,
+		reservedFilenames: Set<string>
 	): Promise<string> {
 		const timestamp = filenameMetadata.needsDate ? filenameMetadata.getTimestamp() : null;
 		const baseFilename = this.buildImageFilename(format, timestamp, index, match.imageSubtype, match.fileExtension);
-		const contentHash = this.computeContentHash(match.base64Payload);
-		const existingFilename = await this.findExistingImageFilename(outputFolderPath, contentHash, match.fileExtension);
-		if (existingFilename) {
-			return existingFilename;
-		}
 
-		const filenameWithHash = this.appendFilenameSuffix(baseFilename, contentHash);
-
-		if (!(await this.app.vault.adapter.exists(normalizePath(`${outputFolderPath}/${filenameWithHash}`)))) {
-			return filenameWithHash;
+		if (await this.isFilenameAvailable(outputFolderPath, baseFilename, reservedFilenames)) {
+			reservedFilenames.add(baseFilename);
+			return baseFilename;
 		}
 
 		let attempt = 2;
 		while (true) {
-			const candidateFilename = this.appendFilenameSuffix(baseFilename, `${contentHash}-${attempt}`);
-			const candidatePath = normalizePath(`${outputFolderPath}/${candidateFilename}`);
-			if (!(await this.app.vault.adapter.exists(candidatePath))) {
+			const candidateFilename = this.appendFilenameSuffix(baseFilename, attempt.toString());
+			if (await this.isFilenameAvailable(outputFolderPath, candidateFilename, reservedFilenames)) {
+				reservedFilenames.add(candidateFilename);
 				return candidateFilename;
 			}
 			attempt++;
 		}
 	}
 
-	private async findExistingImageFilename(outputFolderPath: string, contentHash: string, extension: string): Promise<string | null> {
-		if (!(await this.app.vault.adapter.exists(outputFolderPath))) {
-			return null;
+	private async isFilenameAvailable(outputFolderPath: string, filename: string, reservedFilenames: Set<string>): Promise<boolean> {
+		if (reservedFilenames.has(filename)) {
+			return false;
 		}
 
-		const normalizedExtension = sanitizeFilenameSegment(extension);
-		const escapedHash = escapeForRegExp(contentHash);
-		const escapedExtension = escapeForRegExp(normalizedExtension);
-		const existingFilePattern = new RegExp(`-${escapedHash}(?:-\\d+)?\\.${escapedExtension}$`);
-		const listing = await this.app.vault.adapter.list(outputFolderPath);
-
-		for (const path of listing.files) {
-			const filename = path.split('/').pop();
-			if (filename && existingFilePattern.test(filename)) {
-				return filename;
-			}
-		}
-
-		return null;
+		return !(await this.app.vault.adapter.exists(normalizePath(`${outputFolderPath}/${filename}`)));
 	}
 
 	private appendFilenameSuffix(filename: string, suffix: string): string {
@@ -897,17 +877,6 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 
 		return `${filename.slice(0, extensionIndex)}-${suffix}${filename.slice(extensionIndex)}`;
 	}
-
-	private computeContentHash(base64Payload: string): string {
-		let hash = 2166136261;
-		for (let index = 0; index < base64Payload.length; index++) {
-			hash ^= base64Payload.charCodeAt(index);
-			hash = Math.imul(hash, 16777619);
-		}
-
-		return (hash >>> 0).toString(16).padStart(8, '0');
-	}
-
 	private applyReplacements(content: string, replacements: Array<{ start: number; end: number; replacement: string }>): string {
 		if (replacements.length === 0) {
 			return content;
@@ -964,7 +933,7 @@ class ConvertBase64ToPNGSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Filename format')
-			.setDesc('Format for generated filenames. Available placeholders: {{date}}, {{index}}, {{type}}. The plugin preserves the source image extension; it does not transcode image data.')
+			.setDesc('Format for generated filenames. Available placeholders: {{date}}, {{index}}, {{type}}. The plugin preserves the source image extension, and if a generated name already exists it appends an incrementing numeric suffix.')
 			.addText(text => text
 				.setPlaceholder('image-{{date}}-{{index}}')
 				.setValue(this.plugin.settings.filenameFormat)
