@@ -22,7 +22,7 @@ This fork retains the original copyright and license notices and builds on the o
 - **Customizable Storage**: Configure where and how extracted image files are stored
 - **Flexible Output Links**: Generate standard Markdown image links or Obsidian wikilink embeds
 - **Automatic Conversion**: Option to automatically convert pasted inline base64 image markdown
-- **Idempotent File Reuse**: Reuses previously generated files for identical image content instead of creating duplicates on repeated runs
+- **Collision-Safe Filenames**: Ensures converted images get unique filenames within a document by appending an incrementing numeric suffix when needed
 
 ## How It Works
 
@@ -39,7 +39,7 @@ This makes your notes smaller, more portable, and easier to work with.
 The plugin does **not** transcode non-PNG images into PNG. For example:
 
 - `data:image/png;base64,...` is written as `.png`
-- `data:image/jpeg;base64,...` is written as `.jpg`
+- `data:image/jpeg;base64,...` is written as `.jpeg`
 - `data:image/webp;base64,...` is written as `.webp`
 
 If explicit transcoding is added later, it would need to be implemented as a separate processing step. The current behavior is to preserve the original image data exactly as provided in the note.
@@ -64,7 +64,7 @@ Alt text is preserved only for Markdown output. In wikilink mode the plugin curr
 
 - **Auto Convert**: Automatically convert pasted inline base64 image markdown, optimized to inspect pasted text first and avoid full-note rescans for ordinary paste operations
 - **Output Folder**: Folder where extracted image files will be saved (relative to the note)
-- **Filename Format**: Format for generated filenames with placeholders for date, index, and image type
+- **Filename Format**: Format for generated filenames with placeholders for date, index, and image type; if a generated name already exists, the plugin appends an incrementing numeric suffix
 - **Link Style**: Choose between Markdown image links and Obsidian wikilink embeds
 - **Default Image Size**: Optional size used for wikilink embeds, such as `300` for `![[attachments/image.png|300]]`
 - **Preserve Alt Text in Markdown**: Keep original alt text in Markdown output; wikilink mode ignores alt text for now
